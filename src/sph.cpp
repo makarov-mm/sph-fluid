@@ -135,6 +135,24 @@ void Sph::integrate() {
         if (x.y > p_.boxMax.y) { x.y = p_.boxMax.y; v.y = -v.y * e; }
         if (x.z < p_.boxMin.z) { x.z = p_.boxMin.z; v.z = -v.z * e; }
         if (x.z > p_.boxMax.z) { x.z = p_.boxMax.z; v.z = -v.z * e; }
+
+        if (p_.sphereObstacle) {
+            Vec3 d = x - p_.sphereCenter;
+            float d2 = d.lengthSquared();
+            const float r = p_.sphereRadius;
+            if (d2 < r * r) {
+                float len = std::sqrt(std::max(d2, 1e-12f));
+                Vec3 n = d * (1.0f / len);
+                x = p_.sphereCenter + n * r;
+
+                const float vn = v.dot(n);
+                Vec3 normalVel = n * vn;
+                Vec3 tangentVel = v - normalVel;
+                if (vn < 0.0f) normalVel = normalVel * (-p_.sphereRestitution);
+                tangentVel = tangentVel * std::clamp(1.0f - p_.sphereFriction, 0.0f, 1.0f);
+                v = normalVel + tangentVel;
+            }
+        }
     });
 }
 

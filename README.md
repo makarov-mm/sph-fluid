@@ -71,6 +71,11 @@ Needs a C++20 compiler.
 | `Space`      | pause / resume                    |
 | `↑` / `↓`    | simulation speed (substeps/frame) |
 | `R`          | reset the dam-break               |
+| `M`          | toggle reconstructed surface / particles |
+| `P`          | overlay particles in surface mode |
+| `F`          | toggle foam/spray overlay in surface mode |
+| `O`          | toggle a solid sphere obstacle and restart the scenario |
+| `H`          | toggle the in-window HUD overlay       |
 | `Esc`        | quit                              |
 
 ## What I checked
@@ -99,3 +104,50 @@ src/verify.cpp    headless core check
 ## License
 
 MIT.
+
+
+## Surface rendering
+
+The Win32 viewer now contains a CPU iso-surface reconstruction pass for the SPH particles.
+It samples a compact scalar field around the particles, extracts a triangle mesh on a regular 3D grid, and renders it with a separate OpenGL shader.
+
+Controls:
+
+- `M` toggles between the reconstructed surface and the original particle-sphere view.
+- `P` overlays the particles while the surface view is active.
+- `F` toggles the cheap foam/spray overlay in surface mode.
+- `O` toggles a solid sphere obstacle in the tank and restarts the dam-break, so the water has something to wrap around and collide with.
+- `H` toggles the HUD overlay with FPS, particle count, mode flags and controls.
+
+Visual pass added after the first surface build:
+
+- the water surface shader now uses camera-dependent Fresnel rim light, tighter specular highlights, and height-based deep/shallow water tinting;
+- fast particles near the free surface are rendered as small bright point sprites, giving splashes and foam without changing the solver;
+- the window title shows whether foam overlay is active.
+
+Implementation notes:
+
+- The scalar field is deposited only within a small radius around each particle, so the build cost scales with particle count and local grid density rather than with every particle at every grid sample.
+- The extraction uses a cube grid subdivided into tetrahedra to avoid the large 256-case marching-cubes lookup table while producing the same kind of iso-surface mesh.
+- The surface mesh is rebuilt every second rendered frame by default; change `surfaceBuildStride`, `cell`, `radius`, and `iso` in `viewer_win32.cpp` to tune quality/performance.
+
+
+## Obstacle pass
+
+This version adds a simple solid sphere collider to the SPH solver and renders it as a wireframe obstacle in the tank. It is intentionally implemented in the solver rather than as a post-render trick: particles are projected out of the sphere during integration, their normal velocity is damped/reflected, and tangential velocity is reduced by a simple friction term.
+
+Press `O` to restart the dam-break with the obstacle enabled or disabled. This gives a more interesting video scenario than an empty box: the collapsing water column hits the sphere, splits around it, forms splashes, and then settles back into the pool.
+
+Implementation notes:
+
+- obstacle parameters live in `SphParams` (`sphereCenter`, `sphereRadius`, `sphereRestitution`, `sphereFriction`);
+- collision handling happens in `Sph::integrate()` after wall constraints;
+- the Win32 viewer draws the obstacle as three wire rings appended to the existing tank line buffer;
+- this is a collider, not a sampled boundary particle model, so it is cheap and stable but still visually approximate near the sphere surface.
+
+
+## HUD pass
+
+This version adds an in-window HUD to the native Win32 viewer. The overlay is drawn on top of the OpenGL scene and shows the current FPS, particle count, simulation speed, active render mode, pause state, surface vertex count, and the most important controls.
+
+Press `H` to hide or show the HUD. The window title still contains the compact status line, but the HUD makes recorded videos and screenshots easier to understand without relying on external captions.

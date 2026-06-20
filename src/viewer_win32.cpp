@@ -9,6 +9,11 @@
 //   Space       pause / resume
 //   Up/Down     simulation speed
 //   R           reset
+//   M           toggle surface / particles
+//   P           overlay particles while surface mode is active
+//   F           toggle foam/spray overlay in surface mode
+//   O           toggle solid sphere obstacle
+//   H           toggle HUD overlay
 //   Esc         quit
 
 #ifndef NOMINMAX
@@ -27,6 +32,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <thread>
@@ -209,6 +216,57 @@ uniform vec3 uColor;
 void main(){ frag = vec4(uColor, 1.0); }
 )";
 
+static const char* SURFACE_VS = R"(#version 330 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNormal;
+uniform mat4 uViewProj;
+out vec3 vNormal;
+out vec3 vWorld;
+void main(){
+    vWorld = aPos;
+    vNormal = normalize(aNormal);
+    gl_Position = uViewProj * vec4(aPos, 1.0);
+}
+)";
+
+static const char* SURFACE_FS = R"(#version 330 core
+in vec3 vNormal;
+in vec3 vWorld;
+uniform vec3 uCameraPos;
+uniform vec3 uBoxMax;
+out vec4 frag;
+void main(){
+    vec3 n = normalize(vNormal);
+    vec3 L = normalize(vec3(-0.35, 0.9, 0.45));
+    vec3 V = normalize(uCameraPos - vWorld);
+
+    float ndotl = max(dot(n, L), 0.0);
+    vec3 H = normalize(L + V);
+    float specTight = pow(max(dot(n, H), 0.0), 120.0);
+    float specWide = pow(max(dot(n, H), 0.0), 24.0);
+    float fresnel = pow(1.0 - clamp(dot(n, V), 0.0, 1.0), 4.0);
+
+    float heightT = clamp(vWorld.y / max(uBoxMax.y, 0.001), 0.0, 1.0);
+    vec3 deep = vec3(0.015, 0.10, 0.24);
+    vec3 mid = vec3(0.025, 0.32, 0.62);
+    vec3 shallow = vec3(0.36, 0.78, 0.96);
+    vec3 sky = vec3(0.50, 0.72, 1.00);
+
+    vec3 water = mix(deep, mid, smoothstep(0.0, 0.7, heightT));
+    water = mix(water, shallow, smoothstep(0.72, 1.0, heightT) * 0.55);
+
+    float facing = 0.18 + 0.82 * ndotl;
+    vec3 col = water * facing;
+    col += sky * fresnel * 0.40;
+    col += vec3(1.0) * specTight * 1.15;
+    col += vec3(0.65, 0.86, 1.0) * specWide * 0.20;
+
+    // Slight contact-darkening near the bottom makes the volume read less like plastic.
+    col *= mix(0.72, 1.0, smoothstep(0.0, 0.15, heightT));
+    frag = vec4(col, 1.0);
+}
+)";
+
 static void debugLog(const char* text) {
     OutputDebugStringA(text);
     OutputDebugStringA("\n");
@@ -251,11 +309,14 @@ static GLuint linkProgram(const char* vs, const char* fs) {
     return program;
 }
 
-static std::unique_ptr<Sph> makeSim() {
+static std::unique_ptr<Sph> makeSim(bool obstacle = false) {
     SphParams p;
     p.h = 1.0f;
     p.boxMin = {0, 0, 0};
     p.boxMax = {34, 34, 24};
+    p.sphereObstacle = obstacle;
+    p.sphereCenter = {20.0f, 8.0f, 12.0f};
+    p.sphereRadius = 4.8f;
     auto sim = std::make_unique<Sph>(p);
     sim->emitBlock({1.5f, 1.5f, 1.5f}, {13, 32, 22.5f}, 0.6f);
     sim->setThreads(static_cast<int>(std::thread::hardware_concurrency()));
@@ -274,6 +335,186 @@ static void buildBoxLines(const Vec3& a, const Vec3& b, std::vector<float>& out)
     }
 }
 
+static void appendSphereWire(const Vec3& center, float radius, std::vector<float>& out) {
+    constexpr int segments = 72;
+    auto push = [&](const Vec3& p) {
+        out.push_back(p.x);
+        out.push_back(p.y);
+        out.push_back(p.z);
+    };
+    for (int ring = 0; ring < 3; ++ring) {
+        for (int i = 0; i < segments; ++i) {
+            const float a0 = 6.28318530718f * static_cast<float>(i) / static_cast<float>(segments);
+            const float a1 = 6.28318530718f * static_cast<float>(i + 1) / static_cast<float>(segments);
+            Vec3 p0{}, p1{};
+            if (ring == 0) { // XZ plane
+                p0 = {center.x + std::cos(a0) * radius, center.y, center.z + std::sin(a0) * radius};
+                p1 = {center.x + std::cos(a1) * radius, center.y, center.z + std::sin(a1) * radius};
+            } else if (ring == 1) { // XY plane
+                p0 = {center.x + std::cos(a0) * radius, center.y + std::sin(a0) * radius, center.z};
+                p1 = {center.x + std::cos(a1) * radius, center.y + std::sin(a1) * radius, center.z};
+            } else { // YZ plane
+                p0 = {center.x, center.y + std::cos(a0) * radius, center.z + std::sin(a0) * radius};
+                p1 = {center.x, center.y + std::cos(a1) * radius, center.z + std::sin(a1) * radius};
+            }
+            push(p0);
+            push(p1);
+        }
+    }
+}
+
+static void buildSceneLines(const SphParams& params, std::vector<float>& out) {
+    buildBoxLines(params.boxMin, params.boxMax, out);
+    if (params.sphereObstacle) appendSphereWire(params.sphereCenter, params.sphereRadius, out);
+}
+
+struct SurfaceVertex {
+    Vec3 p;
+    Vec3 n;
+};
+
+struct SurfaceExtractor {
+    float cell = 0.75f;
+    float radius = 1.45f;
+    float iso = 0.48f;
+    Vec3 origin{};
+    int nx = 0, ny = 0, nz = 0;
+    std::vector<float> field;
+    std::vector<SurfaceVertex> vertices;
+
+    int index(int x, int y, int z) const { return x + nx * (y + ny * z); }
+
+    Vec3 posAt(int x, int y, int z) const {
+        return {origin.x + cell * static_cast<float>(x),
+                origin.y + cell * static_cast<float>(y),
+                origin.z + cell * static_cast<float>(z)};
+    }
+
+    float sample(int x, int y, int z) const {
+        x = std::clamp(x, 0, nx - 1);
+        y = std::clamp(y, 0, ny - 1);
+        z = std::clamp(z, 0, nz - 1);
+        return field[index(x, y, z)];
+    }
+
+    Vec3 gradient(int x, int y, int z) const {
+        Vec3 g{sample(x + 1, y, z) - sample(x - 1, y, z),
+               sample(x, y + 1, z) - sample(x, y - 1, z),
+               sample(x, y, z + 1) - sample(x, y, z - 1)};
+        // Field increases towards the fluid interior.  Negating gives outward normals.
+        return (g * -1.0f).normalized();
+    }
+
+    void depositField(const std::vector<Vec3>& particles, const SphParams& params) {
+        origin = params.boxMin;
+        nx = static_cast<int>(std::ceil((params.boxMax.x - params.boxMin.x) / cell)) + 1;
+        ny = static_cast<int>(std::ceil((params.boxMax.y - params.boxMin.y) / cell)) + 1;
+        nz = static_cast<int>(std::ceil((params.boxMax.z - params.boxMin.z) / cell)) + 1;
+        field.assign(static_cast<size_t>(nx) * ny * nz, 0.0f);
+
+        const float r2max = radius * radius;
+        const int cr = static_cast<int>(std::ceil(radius / cell));
+        for (const Vec3& p : particles) {
+            const int cx = static_cast<int>(std::floor((p.x - origin.x) / cell));
+            const int cy = static_cast<int>(std::floor((p.y - origin.y) / cell));
+            const int cz = static_cast<int>(std::floor((p.z - origin.z) / cell));
+            const int x0 = std::max(0, cx - cr), x1 = std::min(nx - 1, cx + cr);
+            const int y0 = std::max(0, cy - cr), y1 = std::min(ny - 1, cy + cr);
+            const int z0 = std::max(0, cz - cr), z1 = std::min(nz - 1, cz + cr);
+            for (int z = z0; z <= z1; ++z) for (int y = y0; y <= y1; ++y) for (int x = x0; x <= x1; ++x) {
+                Vec3 q = posAt(x, y, z);
+                Vec3 d = q - p;
+                const float r2 = d.lengthSquared();
+                if (r2 < r2max) {
+                    const float t = 1.0f - r2 / r2max;
+                    field[index(x, y, z)] += t * t * t;
+                }
+            }
+        }
+    }
+
+    SurfaceVertex vertexOnEdge(const SurfaceVertex& a, float va, const SurfaceVertex& b, float vb) const {
+        float t = (iso - va) / ((vb - va) == 0.0f ? 1.0f : (vb - va));
+        t = std::clamp(t, 0.0f, 1.0f);
+        SurfaceVertex r;
+        r.p = a.p + (b.p - a.p) * t;
+        r.n = (a.n + (b.n - a.n) * t).normalized();
+        return r;
+    }
+
+    void emitTri(const SurfaceVertex& a, const SurfaceVertex& b, const SurfaceVertex& c) {
+        Vec3 fn = (b.p - a.p).cross(c.p - a.p).normalized();
+        if (fn.lengthSquared() == 0.0f) return;
+        vertices.push_back(a);
+        vertices.push_back(b);
+        vertices.push_back(c);
+    }
+
+    void polygonizeTet(const SurfaceVertex v[4], const float val[4]) {
+        int inside[4], outside[4], ni = 0, no = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (val[i] >= iso) inside[ni++] = i;
+            else outside[no++] = i;
+        }
+        if (ni == 0 || ni == 4) return;
+        if (ni == 1) {
+            SurfaceVertex a = vertexOnEdge(v[inside[0]], val[inside[0]], v[outside[0]], val[outside[0]]);
+            SurfaceVertex b = vertexOnEdge(v[inside[0]], val[inside[0]], v[outside[1]], val[outside[1]]);
+            SurfaceVertex c = vertexOnEdge(v[inside[0]], val[inside[0]], v[outside[2]], val[outside[2]]);
+            emitTri(a, b, c);
+        } else if (ni == 3) {
+            SurfaceVertex a = vertexOnEdge(v[outside[0]], val[outside[0]], v[inside[0]], val[inside[0]]);
+            SurfaceVertex b = vertexOnEdge(v[outside[0]], val[outside[0]], v[inside[1]], val[inside[1]]);
+            SurfaceVertex c = vertexOnEdge(v[outside[0]], val[outside[0]], v[inside[2]], val[inside[2]]);
+            emitTri(a, c, b);
+        } else { // ni == 2
+            SurfaceVertex a = vertexOnEdge(v[inside[0]], val[inside[0]], v[outside[0]], val[outside[0]]);
+            SurfaceVertex b = vertexOnEdge(v[inside[0]], val[inside[0]], v[outside[1]], val[outside[1]]);
+            SurfaceVertex c = vertexOnEdge(v[inside[1]], val[inside[1]], v[outside[0]], val[outside[0]]);
+            SurfaceVertex d = vertexOnEdge(v[inside[1]], val[inside[1]], v[outside[1]], val[outside[1]]);
+            emitTri(a, b, c);
+            emitTri(b, d, c);
+        }
+    }
+
+    void build(const std::vector<Vec3>& particles, const SphParams& params) {
+        depositField(particles, params);
+        vertices.clear();
+        vertices.reserve(particles.size() * 3);
+
+        static constexpr int cornerOffset[8][3] = {
+            {0,0,0},{1,0,0},{1,1,0},{0,1,0},
+            {0,0,1},{1,0,1},{1,1,1},{0,1,1}
+        };
+        static constexpr int tetra[6][4] = {
+            {0, 5, 1, 6}, {0, 1, 2, 6}, {0, 2, 3, 6},
+            {0, 3, 7, 6}, {0, 7, 4, 6}, {0, 4, 5, 6}
+        };
+
+        for (int z = 0; z < nz - 1; ++z) for (int y = 0; y < ny - 1; ++y) for (int x = 0; x < nx - 1; ++x) {
+            float cv[8];
+            SurfaceVertex corner[8];
+            float minv = 1e9f, maxv = -1e9f;
+            for (int c = 0; c < 8; ++c) {
+                const int gx = x + cornerOffset[c][0];
+                const int gy = y + cornerOffset[c][1];
+                const int gz = z + cornerOffset[c][2];
+                cv[c] = sample(gx, gy, gz);
+                minv = std::min(minv, cv[c]);
+                maxv = std::max(maxv, cv[c]);
+                corner[c].p = posAt(gx, gy, gz);
+                corner[c].n = gradient(gx, gy, gz);
+            }
+            if (minv > iso || maxv < iso) continue;
+            for (const auto& t : tetra) {
+                SurfaceVertex tv[4] = {corner[t[0]], corner[t[1]], corner[t[2]], corner[t[3]]};
+                float vv[4] = {cv[t[0]], cv[t[1]], cv[t[2]], cv[t[3]]};
+                polygonizeTet(tv, vv);
+            }
+        }
+    }
+};
+
 struct ViewerState {
     HWND hwnd = nullptr;
     HDC hdc = nullptr;
@@ -288,27 +529,45 @@ struct ViewerState {
 
     GLuint particleProgram = 0;
     GLuint lineProgram = 0;
+    GLuint surfaceProgram = 0;
     GLuint particleVao = 0;
     GLuint particleVbo = 0;
     GLuint lineVao = 0;
     GLuint lineVbo = 0;
+    GLuint surfaceVao = 0;
+    GLuint surfaceVbo = 0;
+    GLuint fontBase = 0;
+    HFONT hudFont = nullptr;
+
+    bool surfaceMode = true;
+    bool showParticles = false;
+    bool showFoam = true;
+    bool obstacleEnabled = false;
+    bool showHud = true;
+    int surfaceBuildStride = 2;
+    int surfaceFrame = 0;
+    SurfaceExtractor surface;
 
     std::unique_ptr<Sph> sim;
     std::vector<float> boxLines;
     std::vector<float> interleaved;
+    std::vector<float> foamInterleaved;
 
     int frames = 0;
+    double fpsDisplay = 0.0;
     std::chrono::steady_clock::time_point lastTitleUpdate = std::chrono::steady_clock::now();
 };
 
 static ViewerState* g_state = nullptr;
 
 static void resetSimulation(ViewerState& s) {
-    s.sim = makeSim();
-    buildBoxLines(s.sim->params().boxMin, s.sim->params().boxMax, s.boxLines);
+    s.sim = makeSim(s.obstacleEnabled);
+    buildSceneLines(s.sim->params(), s.boxLines);
     glBindVertexArray_(s.lineVao);
     glBindBuffer_(GL_ARRAY_BUFFER, s.lineVbo);
     glBufferData_(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(s.boxLines.size() * sizeof(float)), s.boxLines.data(), GL_STATIC_DRAW);
+    s.surface.vertices.clear();
+    s.surfaceFrame = 0;
 }
 
 static bool createOpenGLContext(ViewerState& s) {
@@ -334,10 +593,125 @@ static bool createOpenGLContext(ViewerState& s) {
     return loadOpenGL();
 }
 
+
+static void createHudFont(ViewerState& s) {
+    s.fontBase = glGenLists(96);
+    s.hudFont = CreateFontA(
+        -16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        ANTIALIASED_QUALITY, FF_DONTCARE | DEFAULT_PITCH,
+        "Consolas");
+    if (!s.hudFont) {
+        s.hudFont = CreateFontA(
+            -16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            ANTIALIASED_QUALITY, FF_DONTCARE | DEFAULT_PITCH,
+            "Courier New");
+    }
+    HGDIOBJ old = SelectObject(s.hdc, s.hudFont);
+    wglUseFontBitmapsA(s.hdc, 32, 96, s.fontBase);
+    SelectObject(s.hdc, old);
+}
+
+static void drawHudText(const ViewerState& s, int x, int y, const char* text) {
+    glRasterPos2i(x, y);
+    glListBase(s.fontBase - 32);
+    glCallLists(static_cast<GLsizei>(std::strlen(text)), GL_UNSIGNED_BYTE, text);
+}
+
+static void renderHud(const ViewerState& s) {
+    if (!s.showHud || s.fontBase == 0 || !s.sim) return;
+
+    // The panel and bitmap text use the fixed-function pipeline (glOrtho,
+    // glRasterPos, glBegin). A modern shader program is still bound from the
+    // particle/surface passes; while it is active the fixed-function matrices
+    // are ignored and the HUD is transformed by the 3D camera (off-screen).
+    // Return to fixed-function before drawing the overlay.
+    glUseProgram_(0);
+    glBindVertexArray_(0);
+
+    RECT rc{};
+    GetClientRect(s.hwnd, &rc);
+    const int w = std::max(1L, rc.right - rc.left);
+    const int h = std::max(1L, rc.bottom - rc.top);
+
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0.0, static_cast<double>(w), static_cast<double>(h), 0.0, -1.0, 1.0);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    const float panelX = 14.0f;
+    const float panelY = 14.0f;
+    const float panelW = 390.0f;
+    const float panelH = 218.0f;
+    glColor4f(0.02f, 0.025f, 0.035f, 0.72f);
+    glBegin(GL_QUADS);
+    glVertex2f(panelX, panelY);
+    glVertex2f(panelX + panelW, panelY);
+    glVertex2f(panelX + panelW, panelY + panelH);
+    glVertex2f(panelX, panelY + panelH);
+    glEnd();
+
+    glColor4f(0.55f, 0.68f, 0.82f, 0.45f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(panelX, panelY);
+    glVertex2f(panelX + panelW, panelY);
+    glVertex2f(panelX + panelW, panelY + panelH);
+    glVertex2f(panelX, panelY + panelH);
+    glEnd();
+
+    const auto& pos = s.sim->positions();
+    char line[256]{};
+    int y = 38;
+
+    glColor3f(0.86f, 0.93f, 1.0f);
+    drawHudText(s, 28, y, "SPH Fluid / Surface Reconstruction");
+    y += 26;
+
+    glColor3f(0.72f, 0.86f, 1.0f);
+    std::snprintf(line, sizeof(line), "FPS: %.0f    Particles: %zu    Substeps: x%d", s.fpsDisplay, pos.size(), s.substeps);
+    drawHudText(s, 28, y, line);
+    y += 20;
+    std::snprintf(line, sizeof(line), "Mode: %s%s%s%s",
+        s.surfaceMode ? "surface" : "particles",
+        s.showParticles ? " + particles" : "",
+        s.showFoam ? " + foam" : "",
+        s.obstacleEnabled ? " + obstacle" : "");
+    drawHudText(s, 28, y, line);
+    y += 20;
+    std::snprintf(line, sizeof(line), "State: %s    Surface verts: %zu", s.paused ? "paused" : "running", s.surface.vertices.size());
+    drawHudText(s, 28, y, line);
+    y += 30;
+
+    glColor3f(0.86f, 0.88f, 0.90f);
+    drawHudText(s, 28, y, "Controls:"); y += 20;
+    drawHudText(s, 42, y, "Mouse drag / wheel  orbit / zoom"); y += 18;
+    drawHudText(s, 42, y, "Space  pause    R  reset"); y += 18;
+    drawHudText(s, 42, y, "Up/Down  simulation speed"); y += 18;
+    drawHudText(s, 42, y, "M  surface/particles    P  particle overlay"); y += 18;
+    drawHudText(s, 42, y, "F  foam    O  obstacle    H  hide HUD");
+
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+}
+
 static bool initRenderer(ViewerState& s) {
     s.camera.target = {17, 12, 12};
     s.camera.distance = 80.0f;
-    s.sim = makeSim();
+    s.sim = makeSim(s.obstacleEnabled);
 
     glEnable(GL_PROGRAM_POINT_SIZE);
     glEnable(GL_POINT_SPRITE); // compat-profile: required for gl_PointCoord
@@ -345,6 +719,8 @@ static bool initRenderer(ViewerState& s) {
 
     s.particleProgram = linkProgram(PARTICLE_VS, PARTICLE_FS);
     s.lineProgram = linkProgram(LINE_VS, LINE_FS);
+    s.surfaceProgram = linkProgram(SURFACE_VS, SURFACE_FS);
+    createHudFont(s);
 
     glGenVertexArrays_(1, &s.particleVao);
     glGenBuffers_(1, &s.particleVbo);
@@ -357,12 +733,21 @@ static bool initRenderer(ViewerState& s) {
 
     glGenVertexArrays_(1, &s.lineVao);
     glGenBuffers_(1, &s.lineVbo);
-    buildBoxLines(s.sim->params().boxMin, s.sim->params().boxMax, s.boxLines);
+    buildSceneLines(s.sim->params(), s.boxLines);
     glBindVertexArray_(s.lineVao);
     glBindBuffer_(GL_ARRAY_BUFFER, s.lineVbo);
     glBufferData_(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(s.boxLines.size() * sizeof(float)), s.boxLines.data(), GL_STATIC_DRAW);
     glEnableVertexAttribArray_(0);
     glVertexAttribPointer_(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), reinterpret_cast<void*>(0));
+
+    glGenVertexArrays_(1, &s.surfaceVao);
+    glGenBuffers_(1, &s.surfaceVbo);
+    glBindVertexArray_(s.surfaceVao);
+    glBindBuffer_(GL_ARRAY_BUFFER, s.surfaceVbo);
+    glEnableVertexAttribArray_(0);
+    glVertexAttribPointer_(0, 3, GL_FLOAT, GL_FALSE, sizeof(SurfaceVertex), reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray_(1);
+    glVertexAttribPointer_(1, 3, GL_FLOAT, GL_FALSE, sizeof(SurfaceVertex), reinterpret_cast<void*>(sizeof(Vec3)));
 
     RECT rc{};
     GetClientRect(s.hwnd, &rc);
@@ -382,11 +767,26 @@ static void renderFrame(ViewerState& s) {
     const auto& vel = s.sim->velocities();
     const size_t n = pos.size();
     s.interleaved.resize(n * 4);
+    s.foamInterleaved.clear();
+    s.foamInterleaved.reserve(n / 8);
+    const Vec3 boxMax = s.sim->params().boxMax;
     for (size_t i = 0; i < n; ++i) {
+        const float speed = vel[i].length();
         s.interleaved[i * 4 + 0] = pos[i].x;
         s.interleaved[i * 4 + 1] = pos[i].y;
         s.interleaved[i * 4 + 2] = pos[i].z;
-        s.interleaved[i * 4 + 3] = vel[i].length();
+        s.interleaved[i * 4 + 3] = speed;
+
+        // Cheap visual foam/spray: fast particles and particles close to the free surface
+        // are rendered as small bright point sprites over the reconstructed mesh.
+        const bool fast = speed > 5.0f;
+        const bool high = pos[i].y > boxMax.y * 0.45f;
+        if (fast && high) {
+            s.foamInterleaved.push_back(pos[i].x);
+            s.foamInterleaved.push_back(pos[i].y);
+            s.foamInterleaved.push_back(pos[i].z);
+            s.foamInterleaved.push_back(speed);
+        }
     }
 
     glClearColor(0.02f, 0.03f, 0.05f, 1.0f);
@@ -400,14 +800,47 @@ static void renderFrame(ViewerState& s) {
     glBindVertexArray_(s.lineVao);
     glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(s.boxLines.size() / 3));
 
-    glBindBuffer_(GL_ARRAY_BUFFER, s.particleVbo);
-    glBufferData_(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(s.interleaved.size() * sizeof(float)), s.interleaved.data(), GL_STREAM_DRAW);
-    glUseProgram_(s.particleProgram);
-    glUniformMatrix4fv_(glGetUniformLocation_(s.particleProgram, "uViewProj"), 1, GL_FALSE, vp.data());
-    glUniform1f_(glGetUniformLocation_(s.particleProgram, "uPointScale"), 760.0f);
-    glUniform1f_(glGetUniformLocation_(s.particleProgram, "uSpeedScale"), 1.0f / 28.0f);
-    glBindVertexArray_(s.particleVao);
-    glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(n));
+    if (s.surfaceMode) {
+        if ((s.surfaceFrame++ % s.surfaceBuildStride) == 0 || s.surface.vertices.empty()) {
+            s.surface.build(pos, s.sim->params());
+            glBindBuffer_(GL_ARRAY_BUFFER, s.surfaceVbo);
+            glBufferData_(GL_ARRAY_BUFFER,
+                static_cast<GLsizeiptr>(s.surface.vertices.size() * sizeof(SurfaceVertex)),
+                s.surface.vertices.data(), GL_STREAM_DRAW);
+        }
+        glUseProgram_(s.surfaceProgram);
+        glUniformMatrix4fv_(glGetUniformLocation_(s.surfaceProgram, "uViewProj"), 1, GL_FALSE, vp.data());
+        const Vec3 eye = s.camera.eye();
+        const Vec3 box = s.sim->params().boxMax;
+        glUniform3f_(glGetUniformLocation_(s.surfaceProgram, "uCameraPos"), eye.x, eye.y, eye.z);
+        glUniform3f_(glGetUniformLocation_(s.surfaceProgram, "uBoxMax"), box.x, box.y, box.z);
+        glBindVertexArray_(s.surfaceVao);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(s.surface.vertices.size()));
+
+        if (s.showFoam && !s.foamInterleaved.empty()) {
+            glBindBuffer_(GL_ARRAY_BUFFER, s.particleVbo);
+            glBufferData_(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(s.foamInterleaved.size() * sizeof(float)), s.foamInterleaved.data(), GL_STREAM_DRAW);
+            glUseProgram_(s.particleProgram);
+            glUniformMatrix4fv_(glGetUniformLocation_(s.particleProgram, "uViewProj"), 1, GL_FALSE, vp.data());
+            glUniform1f_(glGetUniformLocation_(s.particleProgram, "uPointScale"), 360.0f);
+            glUniform1f_(glGetUniformLocation_(s.particleProgram, "uSpeedScale"), 1.0f / 10.0f);
+            glBindVertexArray_(s.particleVao);
+            glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(s.foamInterleaved.size() / 4));
+        }
+    }
+
+    if (!s.surfaceMode || s.showParticles) {
+        glBindBuffer_(GL_ARRAY_BUFFER, s.particleVbo);
+        glBufferData_(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(s.interleaved.size() * sizeof(float)), s.interleaved.data(), GL_STREAM_DRAW);
+        glUseProgram_(s.particleProgram);
+        glUniformMatrix4fv_(glGetUniformLocation_(s.particleProgram, "uViewProj"), 1, GL_FALSE, vp.data());
+        glUniform1f_(glGetUniformLocation_(s.particleProgram, "uPointScale"), 760.0f);
+        glUniform1f_(glGetUniformLocation_(s.particleProgram, "uSpeedScale"), 1.0f / 28.0f);
+        glBindVertexArray_(s.particleVao);
+        glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(n));
+    }
+
+    renderHud(s);
 
     SwapBuffers(s.hdc);
 
@@ -416,13 +849,14 @@ static void renderFrame(ViewerState& s) {
     const double dt = std::chrono::duration<double>(now - s.lastTitleUpdate).count();
     if (dt >= 0.5) {
         const double fps = static_cast<double>(s.frames) / dt;
+        s.fpsDisplay = fps;
         s.frames = 0;
         s.lastTitleUpdate = now;
 
         char title[192];
         std::snprintf(title, sizeof(title),
-            "SPH Fluid  |  %zu particles  |  %.0f fps  |  x%d%s",
-            n, fps, s.substeps, s.paused ? "  [PAUSED]" : "");
+            "SPH Fluid  |  %zu particles  |  %.0f fps  |  x%d  |  %s%s%s%s",
+            n, fps, s.substeps, s.surfaceMode ? "surface" : "particles", s.showFoam ? " + foam" : "", s.obstacleEnabled ? " + obstacle" : "", s.paused ? "  [PAUSED]" : "");
         SetWindowTextA(s.hwnd, title);
     }
 }
@@ -478,6 +912,11 @@ static LRESULT CALLBACK windowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             else if (wParam == VK_UP) s->substeps = std::min(s->substeps + 1, 16);
             else if (wParam == VK_DOWN) s->substeps = std::max(s->substeps - 1, 1);
             else if (wParam == 'R') resetSimulation(*s);
+            else if (wParam == 'M') s->surfaceMode = !s->surfaceMode;
+            else if (wParam == 'P') s->showParticles = !s->showParticles;
+            else if (wParam == 'F') s->showFoam = !s->showFoam;
+            else if (wParam == 'O') { s->obstacleEnabled = !s->obstacleEnabled; resetSimulation(*s); }
+            else if (wParam == 'H') s->showHud = !s->showHud;
             else if (wParam == VK_ESCAPE) DestroyWindow(hwnd);
         }
         return 0;
@@ -561,6 +1000,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (running) renderFrame(state);
     }
 
+    if (state.fontBase) glDeleteLists(state.fontBase, 96);
+    if (state.hudFont) DeleteObject(state.hudFont);
     if (state.glrc) {
         wglMakeCurrent(nullptr, nullptr);
         wglDeleteContext(state.glrc);

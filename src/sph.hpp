@@ -18,6 +18,15 @@ struct SphParams {
     float boundaryStiffness = 60.0f; // strength of that cushion
     float boundaryDrag = 3.0f;    // viscous drag inside the wall layer (kills climbing)
     float dt = 0.0025f;
+
+    // Optional solid sphere obstacle. Particles are projected out of the sphere
+    // during integration, so it behaves as a simple collider for visual scenarios.
+    bool sphereObstacle = false;
+    Vec3 sphereCenter{17.0f, 10.0f, 12.0f};
+    float sphereRadius = 5.0f;
+    float sphereRestitution = 0.05f;
+    float sphereFriction = 0.55f;
+
     static constexpr float gamma = 7.0f; // Tait exponent
 };
 
@@ -36,6 +45,12 @@ public:
     const std::vector<Vec3>& velocities() const { return vel_; }
     const std::vector<float>& densities() const { return density_; }
     const SphParams& params() const { return p_; }
+    void setSphereObstacle(bool enabled, const Vec3& center, float radius) {
+        p_.sphereObstacle = enabled;
+        p_.sphereCenter = center;
+        p_.sphereRadius = radius;
+    }
+    bool sphereObstacleEnabled() const { return p_.sphereObstacle; }
     void setThreads(int t) { threads_ = t < 1 ? 1 : t; }
 
 private:
