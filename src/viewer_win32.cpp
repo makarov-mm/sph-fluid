@@ -374,9 +374,16 @@ struct SurfaceVertex {
 };
 
 struct SurfaceExtractor {
+    // Metaball field + marching tetrahedra. The field is a sum of smooth radial
+    // kernels around each particle; the iso-surface of that field is the water
+    // skin. Build cost is dominated by deposition and polygonisation, so both
+    // run multi-threaded; a light blur removes the layered "terracing" that a
+    // coarse grid otherwise shows.
     float cell = 0.75f;
-    float radius = 1.45f;
-    float iso = 0.48f;
+    float radius = 1.8f;       // kernel reach; ~3x particle spacing for a watertight skin
+    float iso = 0.42f;         // surface level set
+    int smooth = 1;            // field blur passes (kills terracing; 0 = off)
+    int threads = 0;           // 0 = auto (hardware_concurrency)
     Vec3 origin{};
     int nx = 0, ny = 0, nz = 0;
     std::vector<float> field;
@@ -405,6 +412,21 @@ struct SurfaceExtractor {
         return (g * -1.0f).normalized();
     }
 
+    int threadCount() const {
+        int t = threads > 0 ? threads : static_cast<int>(std::thread::hardware_concurrency());
+        return t < 1 ? 1 : t;
+    }
+
+    // Run fn(slab) for slab in [0, T), one std::thread each.
+    template <class Fn>
+    void forSlabs(int T, Fn&& fn) const {
+        if (T <= 1) { fn(0); return; }
+        std::vector<std::thread> pool;
+        pool.reserve(T);
+        for (int t = 0; t < T; ++t) pool.emplace_back([&fn, t]() { fn(t); });
+        for (auto& th : pool) th.join();
+    }
+
     void depositField(const std::vector<Vec3>& particles, const SphParams& params) {
         origin = params.boxMin;
         nx = static_cast<int>(std::ceil((params.boxMax.x - params.boxMin.x) / cell)) + 1;
@@ -414,43 +436,71 @@ struct SurfaceExtractor {
 
         const float r2max = radius * radius;
         const int cr = static_cast<int>(std::ceil(radius / cell));
-        for (const Vec3& p : particles) {
-            const int cx = static_cast<int>(std::floor((p.x - origin.x) / cell));
-            const int cy = static_cast<int>(std::floor((p.y - origin.y) / cell));
-            const int cz = static_cast<int>(std::floor((p.z - origin.z) / cell));
-            const int x0 = std::max(0, cx - cr), x1 = std::min(nx - 1, cx + cr);
-            const int y0 = std::max(0, cy - cr), y1 = std::min(ny - 1, cy + cr);
-            const int z0 = std::max(0, cz - cr), z1 = std::min(nz - 1, cz + cr);
-            for (int z = z0; z <= z1; ++z) for (int y = y0; y <= y1; ++y) for (int x = x0; x <= x1; ++x) {
-                Vec3 q = posAt(x, y, z);
-                Vec3 d = q - p;
-                const float r2 = d.lengthSquared();
-                if (r2 < r2max) {
-                    const float t = 1.0f - r2 / r2max;
-                    field[index(x, y, z)] += t * t * t;
+        const int T = threadCount();
+        // Each thread owns a disjoint band of z rows and only ever writes into
+        // its own band, so there are no data races without any locking.
+        forSlabs(T, [&](int s) {
+            const int zlo = static_cast<int>(static_cast<long long>(s) * nz / T);
+            const int zhi = static_cast<int>(static_cast<long long>(s + 1) * nz / T);
+            for (const Vec3& p : particles) {
+                const int cx = static_cast<int>(std::floor((p.x - origin.x) / cell));
+                const int cy = static_cast<int>(std::floor((p.y - origin.y) / cell));
+                const int cz = static_cast<int>(std::floor((p.z - origin.z) / cell));
+                const int z0 = std::max(zlo, cz - cr), z1 = std::min(zhi - 1, cz + cr);
+                if (z0 > z1) continue;
+                const int x0 = std::max(0, cx - cr), x1 = std::min(nx - 1, cx + cr);
+                const int y0 = std::max(0, cy - cr), y1 = std::min(ny - 1, cy + cr);
+                for (int z = z0; z <= z1; ++z) for (int y = y0; y <= y1; ++y) for (int x = x0; x <= x1; ++x) {
+                    Vec3 d = posAt(x, y, z) - p;
+                    const float r2 = d.lengthSquared();
+                    if (r2 < r2max) {
+                        const float t = 1.0f - r2 / r2max;
+                        field[index(x, y, z)] += t * t * t;
+                    }
                 }
             }
-        }
+        });
+    }
+
+    void blurField() {
+        if (smooth <= 0) return;
+        const int T = threadCount();
+        std::vector<float> tmp(field.size());
+        auto pass = [&](int axis) {
+            forSlabs(T, [&](int s) {
+                const int zlo = static_cast<int>(static_cast<long long>(s) * nz / T);
+                const int zhi = static_cast<int>(static_cast<long long>(s + 1) * nz / T);
+                for (int z = zlo; z < zhi; ++z) for (int y = 0; y < ny; ++y) for (int x = 0; x < nx; ++x) {
+                    int xm = x, ym = y, zm = z, xp = x, yp = y, zp = z;
+                    if (axis == 0) { xm = std::max(0, x - 1); xp = std::min(nx - 1, x + 1); }
+                    else if (axis == 1) { ym = std::max(0, y - 1); yp = std::min(ny - 1, y + 1); }
+                    else { zm = std::max(0, z - 1); zp = std::min(nz - 1, z + 1); }
+                    tmp[index(x, y, z)] = 0.25f * field[index(xm, ym, zm)]
+                                        + 0.5f  * field[index(x, y, z)]
+                                        + 0.25f * field[index(xp, yp, zp)];
+                }
+            });
+            field.swap(tmp);
+        };
+        for (int i = 0; i < smooth; ++i) { pass(0); pass(1); pass(2); }
     }
 
     SurfaceVertex vertexOnEdge(const SurfaceVertex& a, float va, const SurfaceVertex& b, float vb) const {
-        float t = (iso - va) / ((vb - va) == 0.0f ? 1.0f : (vb - va));
-        t = std::clamp(t, 0.0f, 1.0f);
+        float denom = (vb - va) == 0.0f ? 1.0f : (vb - va);
+        float t = std::clamp((iso - va) / denom, 0.0f, 1.0f);
         SurfaceVertex r;
         r.p = a.p + (b.p - a.p) * t;
         r.n = (a.n + (b.n - a.n) * t).normalized();
         return r;
     }
 
-    void emitTri(const SurfaceVertex& a, const SurfaceVertex& b, const SurfaceVertex& c) {
-        Vec3 fn = (b.p - a.p).cross(c.p - a.p).normalized();
-        if (fn.lengthSquared() == 0.0f) return;
-        vertices.push_back(a);
-        vertices.push_back(b);
-        vertices.push_back(c);
+    void emitTri(std::vector<SurfaceVertex>& out, const SurfaceVertex& a, const SurfaceVertex& b, const SurfaceVertex& c) const {
+        out.push_back(a);
+        out.push_back(b);
+        out.push_back(c);
     }
 
-    void polygonizeTet(const SurfaceVertex v[4], const float val[4]) {
+    void polygonizeTet(std::vector<SurfaceVertex>& out, const SurfaceVertex v[4], const float val[4]) const {
         int inside[4], outside[4], ni = 0, no = 0;
         for (int i = 0; i < 4; ++i) {
             if (val[i] >= iso) inside[ni++] = i;
@@ -458,29 +508,28 @@ struct SurfaceExtractor {
         }
         if (ni == 0 || ni == 4) return;
         if (ni == 1) {
-            SurfaceVertex a = vertexOnEdge(v[inside[0]], val[inside[0]], v[outside[0]], val[outside[0]]);
-            SurfaceVertex b = vertexOnEdge(v[inside[0]], val[inside[0]], v[outside[1]], val[outside[1]]);
-            SurfaceVertex c = vertexOnEdge(v[inside[0]], val[inside[0]], v[outside[2]], val[outside[2]]);
-            emitTri(a, b, c);
+            emitTri(out,
+                vertexOnEdge(v[inside[0]], val[inside[0]], v[outside[0]], val[outside[0]]),
+                vertexOnEdge(v[inside[0]], val[inside[0]], v[outside[1]], val[outside[1]]),
+                vertexOnEdge(v[inside[0]], val[inside[0]], v[outside[2]], val[outside[2]]));
         } else if (ni == 3) {
-            SurfaceVertex a = vertexOnEdge(v[outside[0]], val[outside[0]], v[inside[0]], val[inside[0]]);
-            SurfaceVertex b = vertexOnEdge(v[outside[0]], val[outside[0]], v[inside[1]], val[inside[1]]);
-            SurfaceVertex c = vertexOnEdge(v[outside[0]], val[outside[0]], v[inside[2]], val[inside[2]]);
-            emitTri(a, c, b);
+            emitTri(out,
+                vertexOnEdge(v[outside[0]], val[outside[0]], v[inside[0]], val[inside[0]]),
+                vertexOnEdge(v[outside[0]], val[outside[0]], v[inside[2]], val[inside[2]]),
+                vertexOnEdge(v[outside[0]], val[outside[0]], v[inside[1]], val[inside[1]]));
         } else { // ni == 2
             SurfaceVertex a = vertexOnEdge(v[inside[0]], val[inside[0]], v[outside[0]], val[outside[0]]);
             SurfaceVertex b = vertexOnEdge(v[inside[0]], val[inside[0]], v[outside[1]], val[outside[1]]);
             SurfaceVertex c = vertexOnEdge(v[inside[1]], val[inside[1]], v[outside[0]], val[outside[0]]);
             SurfaceVertex d = vertexOnEdge(v[inside[1]], val[inside[1]], v[outside[1]], val[outside[1]]);
-            emitTri(a, b, c);
-            emitTri(b, d, c);
+            emitTri(out, a, b, c);
+            emitTri(out, b, d, c);
         }
     }
 
     void build(const std::vector<Vec3>& particles, const SphParams& params) {
         depositField(particles, params);
-        vertices.clear();
-        vertices.reserve(particles.size() * 3);
+        blurField();
 
         static constexpr int cornerOffset[8][3] = {
             {0,0,0},{1,0,0},{1,1,0},{0,1,0},
@@ -491,27 +540,42 @@ struct SurfaceExtractor {
             {0, 3, 7, 6}, {0, 7, 4, 6}, {0, 4, 5, 6}
         };
 
-        for (int z = 0; z < nz - 1; ++z) for (int y = 0; y < ny - 1; ++y) for (int x = 0; x < nx - 1; ++x) {
-            float cv[8];
-            SurfaceVertex corner[8];
-            float minv = 1e9f, maxv = -1e9f;
-            for (int c = 0; c < 8; ++c) {
-                const int gx = x + cornerOffset[c][0];
-                const int gy = y + cornerOffset[c][1];
-                const int gz = z + cornerOffset[c][2];
-                cv[c] = sample(gx, gy, gz);
-                minv = std::min(minv, cv[c]);
-                maxv = std::max(maxv, cv[c]);
-                corner[c].p = posAt(gx, gy, gz);
-                corner[c].n = gradient(gx, gy, gz);
+        const int T = threadCount();
+        std::vector<std::vector<SurfaceVertex>> bins(T);
+        forSlabs(T, [&](int s) {
+            const int zlo = static_cast<int>(static_cast<long long>(s) * (nz - 1) / T);
+            const int zhi = static_cast<int>(static_cast<long long>(s + 1) * (nz - 1) / T);
+            std::vector<SurfaceVertex>& out = bins[s];
+            for (int z = zlo; z < zhi; ++z) for (int y = 0; y < ny - 1; ++y) for (int x = 0; x < nx - 1; ++x) {
+                float cv[8];
+                float minv = 1e9f, maxv = -1e9f;
+                for (int c = 0; c < 8; ++c) {
+                    cv[c] = sample(x + cornerOffset[c][0], y + cornerOffset[c][1], z + cornerOffset[c][2]);
+                    minv = std::min(minv, cv[c]);
+                    maxv = std::max(maxv, cv[c]);
+                }
+                if (minv > iso || maxv < iso) continue;   // skip empty/interior cells before any gradient work
+                SurfaceVertex corner[8];
+                for (int c = 0; c < 8; ++c) {
+                    const int gx = x + cornerOffset[c][0];
+                    const int gy = y + cornerOffset[c][1];
+                    const int gz = z + cornerOffset[c][2];
+                    corner[c].p = posAt(gx, gy, gz);
+                    corner[c].n = gradient(gx, gy, gz);
+                }
+                for (const auto& t : tetra) {
+                    SurfaceVertex tv[4] = {corner[t[0]], corner[t[1]], corner[t[2]], corner[t[3]]};
+                    float vv[4] = {cv[t[0]], cv[t[1]], cv[t[2]], cv[t[3]]};
+                    polygonizeTet(out, tv, vv);
+                }
             }
-            if (minv > iso || maxv < iso) continue;
-            for (const auto& t : tetra) {
-                SurfaceVertex tv[4] = {corner[t[0]], corner[t[1]], corner[t[2]], corner[t[3]]};
-                float vv[4] = {cv[t[0]], cv[t[1]], cv[t[2]], cv[t[3]]};
-                polygonizeTet(tv, vv);
-            }
-        }
+        });
+
+        vertices.clear();
+        size_t total = 0;
+        for (auto& b : bins) total += b.size();
+        vertices.reserve(total);
+        for (auto& b : bins) vertices.insert(vertices.end(), b.begin(), b.end());
     }
 };
 
