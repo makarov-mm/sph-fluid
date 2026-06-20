@@ -235,35 +235,85 @@ in vec3 vWorld;
 uniform vec3 uCameraPos;
 uniform vec3 uBoxMax;
 out vec4 frag;
+
+vec3 skyColor(vec3 d){
+    float t = clamp(d.y * 0.5 + 0.5, 0.0, 1.0);
+    vec3 horizon = vec3(0.55, 0.65, 0.78);
+    vec3 zenith  = vec3(0.10, 0.22, 0.45);
+    vec3 ground  = vec3(0.05, 0.06, 0.08);
+    vec3 sky = mix(horizon, zenith, smoothstep(0.5, 1.0, t));
+    sky = mix(ground, sky, smoothstep(0.42, 0.5, t));
+    vec3 sun = normalize(vec3(-0.35, 0.85, 0.45));
+    float sd = max(dot(d, sun), 0.0);
+    sky += vec3(1.0, 0.90, 0.75) * pow(sd, 350.0) * 3.0;   // sun disk
+    sky += vec3(1.0, 0.85, 0.70) * pow(sd, 8.0) * 0.15;    // sun glow
+    return sky;
+}
+
 void main(){
     vec3 n = normalize(vNormal);
-    vec3 L = normalize(vec3(-0.35, 0.9, 0.45));
     vec3 V = normalize(uCameraPos - vWorld);
+    if (dot(n, V) < 0.0) n = -n;                       // two-sided: face the camera
 
-    float ndotl = max(dot(n, L), 0.0);
-    vec3 H = normalize(L + V);
-    float specTight = pow(max(dot(n, H), 0.0), 120.0);
-    float specWide = pow(max(dot(n, H), 0.0), 24.0);
-    float fresnel = pow(1.0 - clamp(dot(n, V), 0.0, 1.0), 4.0);
+    vec3 R = reflect(-V, n);
+    vec3 refl = skyColor(R);
+    float fres = 0.02 + 0.98 * pow(1.0 - clamp(dot(n, V), 0.0, 1.0), 5.0);
 
-    float heightT = clamp(vWorld.y / max(uBoxMax.y, 0.001), 0.0, 1.0);
-    vec3 deep = vec3(0.015, 0.10, 0.24);
-    vec3 mid = vec3(0.025, 0.32, 0.62);
-    vec3 shallow = vec3(0.36, 0.78, 0.96);
-    vec3 sky = vec3(0.50, 0.72, 1.00);
+    float h = clamp(vWorld.y / max(uBoxMax.y, 0.001), 0.0, 1.0);
+    vec3 deep    = vec3(0.015, 0.09, 0.17);
+    vec3 shallow = vec3(0.10, 0.42, 0.55);
+    vec3 body = mix(deep, shallow, h);                 // refraction/body tint, deeper = darker
 
-    vec3 water = mix(deep, mid, smoothstep(0.0, 0.7, heightT));
-    water = mix(water, shallow, smoothstep(0.72, 1.0, heightT) * 0.55);
+    vec3 col = mix(body, refl, fres);                  // Fresnel reflection over body
 
-    float facing = 0.18 + 0.82 * ndotl;
-    vec3 col = water * facing;
-    col += sky * fresnel * 0.40;
-    col += vec3(1.0) * specTight * 1.15;
-    col += vec3(0.65, 0.86, 1.0) * specWide * 0.20;
+    vec3 sun = normalize(vec3(-0.35, 0.85, 0.45));
+    vec3 Hh = normalize(sun + V);
+    float spec = pow(max(dot(n, Hh), 0.0), 200.0);
+    col += vec3(1.0, 0.95, 0.85) * spec * 1.2;         // sharp sun glint
+    col += vec3(0.0, 0.25, 0.30) * max(dot(n, sun), 0.0) * 0.12; // subsurface tint
 
-    // Slight contact-darkening near the bottom makes the volume read less like plastic.
-    col *= mix(0.72, 1.0, smoothstep(0.0, 0.15, heightT));
+    col = col / (col + vec3(1.0));                      // Reinhard tonemap
+    col = pow(col, vec3(1.0 / 2.2));                    // gamma
     frag = vec4(col, 1.0);
+}
+)";
+
+static const char* SKY_VS = R"(#version 330 core
+out vec2 vNdc;
+void main(){
+    vec2 p = vec2((gl_VertexID == 1) ? 3.0 : -1.0,
+                  (gl_VertexID == 2) ? 3.0 : -1.0);
+    vNdc = p;
+    gl_Position = vec4(p, 0.0, 1.0);
+}
+)";
+
+static const char* SKY_FS = R"(#version 330 core
+in vec2 vNdc;
+out vec4 frag;
+uniform vec3 uEye, uForward, uRight, uUp;
+uniform float uTanHalf, uAspect;
+
+vec3 skyColor(vec3 d){
+    float t = clamp(d.y * 0.5 + 0.5, 0.0, 1.0);
+    vec3 horizon = vec3(0.55, 0.65, 0.78);
+    vec3 zenith  = vec3(0.10, 0.22, 0.45);
+    vec3 ground  = vec3(0.05, 0.06, 0.08);
+    vec3 sky = mix(horizon, zenith, smoothstep(0.5, 1.0, t));
+    sky = mix(ground, sky, smoothstep(0.42, 0.5, t));
+    vec3 sun = normalize(vec3(-0.35, 0.85, 0.45));
+    float sd = max(dot(d, sun), 0.0);
+    sky += vec3(1.0, 0.90, 0.75) * pow(sd, 350.0) * 3.0;
+    sky += vec3(1.0, 0.85, 0.70) * pow(sd, 8.0) * 0.15;
+    return sky;
+}
+
+void main(){
+    vec3 rd = normalize(uForward + vNdc.x * uTanHalf * uAspect * uRight + vNdc.y * uTanHalf * uUp);
+    vec3 c = skyColor(rd);
+    c = c / (c + vec3(1.0));
+    c = pow(c, vec3(1.0 / 2.2));
+    frag = vec4(c, 1.0);
 }
 )";
 
@@ -594,11 +644,13 @@ struct ViewerState {
     GLuint particleProgram = 0;
     GLuint lineProgram = 0;
     GLuint surfaceProgram = 0;
+    GLuint skyProgram = 0;
     GLuint particleVao = 0;
     GLuint particleVbo = 0;
     GLuint lineVao = 0;
     GLuint lineVbo = 0;
     GLuint surfaceVao = 0;
+    GLuint skyVao = 0;
     GLuint surfaceVbo = 0;
     GLuint fontBase = 0;
     HFONT hudFont = nullptr;
@@ -784,6 +836,8 @@ static bool initRenderer(ViewerState& s) {
     s.particleProgram = linkProgram(PARTICLE_VS, PARTICLE_FS);
     s.lineProgram = linkProgram(LINE_VS, LINE_FS);
     s.surfaceProgram = linkProgram(SURFACE_VS, SURFACE_FS);
+    s.skyProgram = linkProgram(SKY_VS, SKY_FS);
+    glGenVertexArrays_(1, &s.skyVao);   // empty VAO for the fullscreen sky triangle
     createHudFont(s);
 
     glGenVertexArrays_(1, &s.particleVao);
@@ -855,6 +909,29 @@ static void renderFrame(ViewerState& s) {
 
     glClearColor(0.02f, 0.03f, 0.05f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // Procedural sky background. Drawn first with depth writes off so every later
+    // pass sits on top; it also gives the water something to reflect.
+    {
+        const Vec3 eye = s.camera.eye();
+        const Vec3 fwd = (s.camera.target - eye).normalized();
+        const Vec3 right = fwd.cross(Vec3{0, 1, 0}).normalized();
+        const Vec3 up = right.cross(fwd);
+        const float tanHalf = std::tan(s.camera.fov * 0.5f);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_DEPTH_TEST);
+        glUseProgram_(s.skyProgram);
+        glUniform3f_(glGetUniformLocation_(s.skyProgram, "uEye"), eye.x, eye.y, eye.z);
+        glUniform3f_(glGetUniformLocation_(s.skyProgram, "uForward"), fwd.x, fwd.y, fwd.z);
+        glUniform3f_(glGetUniformLocation_(s.skyProgram, "uRight"), right.x, right.y, right.z);
+        glUniform3f_(glGetUniformLocation_(s.skyProgram, "uUp"), up.x, up.y, up.z);
+        glUniform1f_(glGetUniformLocation_(s.skyProgram, "uTanHalf"), tanHalf);
+        glUniform1f_(glGetUniformLocation_(s.skyProgram, "uAspect"), s.camera.aspect);
+        glBindVertexArray_(s.skyVao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glEnable(GL_DEPTH_TEST);
+        glDepthMask(GL_TRUE);
+    }
 
     Mat4 vp = s.camera.viewProj();
 
