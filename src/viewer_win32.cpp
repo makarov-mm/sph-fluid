@@ -256,12 +256,12 @@ void main(){
     if (dot(n, V) < 0.0) n = -n;                       // two-sided: face the camera
 
     vec3 R = reflect(-V, n);
-    vec3 refl = skyColor(R);
-    float fres = 0.02 + 0.98 * pow(1.0 - clamp(dot(n, V), 0.0, 1.0), 5.0);
+    vec3 refl = skyColor(R) * 0.7;                     // tame sky washout
+    float fres = 0.04 + 0.60 * pow(1.0 - clamp(dot(n, V), 0.0, 1.0), 5.0);  // capped: body always shows
 
     float h = clamp(vWorld.y / max(uBoxMax.y, 0.001), 0.0, 1.0);
-    vec3 deep    = vec3(0.015, 0.09, 0.17);
-    vec3 shallow = vec3(0.10, 0.42, 0.55);
+    vec3 deep    = vec3(0.01, 0.10, 0.22);
+    vec3 shallow = vec3(0.05, 0.34, 0.52);             // richer teal-blue
     vec3 body = mix(deep, shallow, h);                 // refraction/body tint, deeper = darker
 
     vec3 col = mix(body, refl, fres);                  // Fresnel reflection over body
@@ -478,36 +478,50 @@ struct SurfaceExtractor {
     }
 
     void depositField(const std::vector<Vec3>& particles, const SphParams& params) {
-        origin = params.boxMin;
-        nx = static_cast<int>(std::ceil((params.boxMax.x - params.boxMin.x) / cell)) + 1;
-        ny = static_cast<int>(std::ceil((params.boxMax.y - params.boxMin.y) / cell)) + 1;
-        nz = static_cast<int>(std::ceil((params.boxMax.z - params.boxMin.z) / cell)) + 1;
+        // Pad one empty cell around the domain so the iso-surface closes off
+        // against the container walls instead of leaving an open boundary.
+        origin = params.boxMin - Vec3{cell, cell, cell};
+        nx = static_cast<int>(std::ceil((params.boxMax.x - params.boxMin.x) / cell)) + 3;
+        ny = static_cast<int>(std::ceil((params.boxMax.y - params.boxMin.y) / cell)) + 3;
+        nz = static_cast<int>(std::ceil((params.boxMax.z - params.boxMin.z) / cell)) + 3;
         field.assign(static_cast<size_t>(nx) * ny * nz, 0.0f);
 
         const float r2max = radius * radius;
         const int cr = static_cast<int>(std::ceil(radius / cell));
+        const Vec3 bmn = params.boxMin, bmx = params.boxMax;
         const int T = threadCount();
         // Each thread owns a disjoint band of z rows and only ever writes into
         // its own band, so there are no data races without any locking.
         forSlabs(T, [&](int s) {
             const int zlo = static_cast<int>(static_cast<long long>(s) * nz / T);
             const int zhi = static_cast<int>(static_cast<long long>(s + 1) * nz / T);
-            for (const Vec3& p : particles) {
-                const int cx = static_cast<int>(std::floor((p.x - origin.x) / cell));
-                const int cy = static_cast<int>(std::floor((p.y - origin.y) / cell));
-                const int cz = static_cast<int>(std::floor((p.z - origin.z) / cell));
+            auto splat = [&](float px, float py, float pz) {
+                const int cx = static_cast<int>(std::floor((px - origin.x) / cell));
+                const int cy = static_cast<int>(std::floor((py - origin.y) / cell));
+                const int cz = static_cast<int>(std::floor((pz - origin.z) / cell));
                 const int z0 = std::max(zlo, cz - cr), z1 = std::min(zhi - 1, cz + cr);
-                if (z0 > z1) continue;
+                if (z0 > z1) return;
                 const int x0 = std::max(0, cx - cr), x1 = std::min(nx - 1, cx + cr);
                 const int y0 = std::max(0, cy - cr), y1 = std::min(ny - 1, cy + cr);
                 for (int z = z0; z <= z1; ++z) for (int y = y0; y <= y1; ++y) for (int x = x0; x <= x1; ++x) {
-                    Vec3 d = posAt(x, y, z) - p;
+                    Vec3 d = posAt(x, y, z) - Vec3{px, py, pz};
                     const float r2 = d.lengthSquared();
                     if (r2 < r2max) {
                         const float t = 1.0f - r2 / r2max;
                         field[index(x, y, z)] += t * t * t;
                     }
                 }
+            };
+            for (const Vec3& p : particles) {
+                splat(p.x, p.y, p.z);
+                // Mirror particles across the 4 side walls and the floor so the
+                // field reaches the iso level flush against them (the open top
+                // is deliberately not mirrored).
+                if (p.x - bmn.x < radius) splat(2.0f * bmn.x - p.x, p.y, p.z);
+                if (bmx.x - p.x < radius) splat(2.0f * bmx.x - p.x, p.y, p.z);
+                if (p.z - bmn.z < radius) splat(p.x, p.y, 2.0f * bmn.z - p.z);
+                if (bmx.z - p.z < radius) splat(p.x, p.y, 2.0f * bmx.z - p.z);
+                if (p.y - bmn.y < radius) splat(p.x, 2.0f * bmn.y - p.y, p.z);
             }
         });
     }
@@ -660,7 +674,7 @@ struct ViewerState {
     bool showFoam = true;
     bool obstacleEnabled = false;
     bool showHud = true;
-    int surfaceBuildStride = 2;
+    int surfaceBuildStride = 3;
     int surfaceFrame = 0;
     SurfaceExtractor surface;
 
@@ -887,7 +901,9 @@ static void renderFrame(ViewerState& s) {
     s.interleaved.resize(n * 4);
     s.foamInterleaved.clear();
     s.foamInterleaved.reserve(n / 8);
-    const Vec3 boxMax = s.sim->params().boxMax;
+    const std::vector<float>& density = s.sim->densities();
+    const bool haveDensity = density.size() == n;
+    const float foamRho = 0.55f * s.sim->params().restDensity;  // isolated = sparse neighbourhood
     for (size_t i = 0; i < n; ++i) {
         const float speed = vel[i].length();
         s.interleaved[i * 4 + 0] = pos[i].x;
@@ -895,11 +911,12 @@ static void renderFrame(ViewerState& s) {
         s.interleaved[i * 4 + 2] = pos[i].z;
         s.interleaved[i * 4 + 3] = speed;
 
-        // Cheap visual foam/spray: fast particles and particles close to the free surface
-        // are rendered as small bright point sprites over the reconstructed mesh.
-        const bool fast = speed > 5.0f;
-        const bool high = pos[i].y > boxMax.y * 0.45f;
-        if (fast && high) {
+        // Real spray/foam is made of isolated droplets, which read as a low local
+        // density. Selecting on density (not just speed+height) keeps coherent
+        // sheets of water as solid surface instead of a grid of point sprites.
+        const bool isolated = haveDensity && density[i] < foamRho;
+        const bool moving = speed > 3.0f;
+        if (isolated && moving) {
             s.foamInterleaved.push_back(pos[i].x);
             s.foamInterleaved.push_back(pos[i].y);
             s.foamInterleaved.push_back(pos[i].z);
