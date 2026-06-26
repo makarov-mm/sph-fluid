@@ -151,3 +151,9 @@ Implementation notes:
 This version adds an in-window HUD to the native Win32 viewer. The overlay is drawn on top of the OpenGL scene and shows the current FPS, particle count, simulation speed, active render mode, pause state, surface vertex count, and the most important controls.
 
 Press `H` to hide or show the HUD. The window title still contains the compact status line, but the HUD makes recorded videos and screenshots easier to understand without relying on external captions.
+
+## Support
+
+If you found this project interesting or useful, you can support my work:
+
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/makarov-mm?style=flat&logo=github)](https://github.com/sponsors/makarov-mm)
