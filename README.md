@@ -11,8 +11,8 @@
 
 A 3D water simulator written from scratch in C++. The water is thousands of
 particles pulling on each other; there's no game engine and no physics library
-doing the work. The only outside code in the project opens a window and talks to
-OpenGL.
+doing the work, and no third-party code at all: the viewer talks to Win32 and
+OpenGL directly.
 
 I wrote it to understand how fluids are actually simulated, instead of wrapping
 someone else's solver.
@@ -35,10 +35,12 @@ The parts that actually matter for getting water that behaves:
 - **Stability** comes from Monaghan artificial viscosity, which bleeds off energy
   when particles rush together. Without it, a dropped column of water doesn't
   settle, it detonates.
-- **Neighbours** are found with a uniform spatial-hash grid (cell size = the
-  smoothing radius, built with a counting sort), so each step costs O(N) instead
-  of O(N²).
-- **Time stepping** is semi-implicit Euler at a CFL-limited step.
+- **Neighbours** are found with a uniform grid (cell size = the smoothing radius,
+  built with a counting sort), so each step costs O(N) instead of O(N²). The
+  particles are re-sorted by cell every step, so neighbours also sit next to each
+  other in memory.
+- **Time stepping** is semi-implicit Euler with a fixed step that stays inside the
+  CFL limit for the chosen sound speed.
 
 There's also a thin repulsive cushion at the tank walls. Particles next to a wall
 are missing the neighbours that would sit on the other side of it, so their
@@ -46,144 +48,87 @@ density reads low and the wall never pushes back. Left alone, sloshing water
 climbs the walls and sticks there. The cushion (plus a little drag in the
 boundary layer) fixes it.
 
-Particles are drawn as small lit spheres, blue when calm and white where the
-water moves fast, inside a wireframe tank.
+Every pass runs on a small persistent thread pool, so the work spreads over all
+cores without creating threads every step.
+
+## Rendering
+
+The water surface is reconstructed on the CPU. Every particle adds a smooth
+kernel to a scalar field on a regular grid (particles near the walls and the floor
+are mirrored, so the surface meets them at the right height), a light blur
+removes the terracing of the coarse grid, and the boundary of the water is
+triangulated with marching tetrahedra: each grid cube is split into six
+tetrahedra, which needs no 256-case lookup table and has no ambiguous cases. The
+grid is aligned with the tank, and the water is clipped to the glass and the
+floor, so the body is closed with flat faces where it touches them. The mesh is
+rebuilt whenever the simulation advances.
+
+The water shader blends a procedural sky reflection over a depth-tinted body with
+a Fresnel term and adds a sharp sun glint. Fast particles in a sparse
+neighbourhood are drawn as foam and spray. `M` switches to the raw particles,
+drawn as lit spheres that go from blue to white with speed.
+
+`O` restarts the dam break with a solid sphere in the way. It is a collider in the
+solver, not a rendering trick: particles that end up inside are projected back to
+its surface, their normal velocity is reflected with damping and the tangential
+one is cut by friction. Cheap and stable, but only approximate right at the
+sphere.
+
+The HUD (`H`) shows FPS, particle count, simulation speed, the active mode and the
+controls; the window title carries a compact version of the same.
+
+Knobs: surface quality in `SurfaceSettings` (`src/surface.hpp`), solver
+parameters in `SphParams` (`src/sph.hpp`), the scenario in `src/scene.cpp`.
 
 ## Build
 
-### Visual Studio (Windows)
+Windows 10 or later and Visual Studio 2026 with the *Desktop development with C++*
+workload.
 
-Open `SphFluidViewer.sln`, set the configuration to **Release | x64**, and run
-(`Ctrl+F5`). No external dependencies — it links only `opengl32`, `gdi32` and
-`user32` from the Windows SDK, and loads the OpenGL functions it needs at
-runtime. Run on a machine with real GPU drivers (over Remote Desktop there's no
-OpenGL 3.3).
-
-### CMake (cross-platform)
-
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-./build/sph_fluid        # viewer
-./build/verify           # headless core check, no GPU needed
-```
-
-CMake pulls GLFW and GLAD automatically, so there's nothing to install by hand.
-Needs a C++20 compiler.
+Open `SphFluidViewer.slnx`, set the configuration to **Release | x64**, and run
+(`Ctrl+F5`). There are no external dependencies: the project links only
+`opengl32`, `gdi32` and `user32` from the Windows SDK and loads the OpenGL 3.3
+functions it needs at runtime. It needs a GPU driver with OpenGL 3.3; over Remote
+Desktop or on the basic display driver there isn't one, and the program says so.
 
 ## Controls
 
-| Input        | Action                            |
-|--------------|-----------------------------------|
-| left-drag    | orbit the camera                  |
-| mouse wheel  | zoom                              |
-| `Space`      | pause / resume                    |
-| `↑` / `↓`    | simulation speed (substeps/frame) |
-| `R`          | reset the dam-break               |
-| `M`          | toggle reconstructed surface / particles |
-| `P`          | overlay particles in surface mode |
-| `F`          | toggle foam/spray overlay in surface mode |
-| `O`          | toggle a solid sphere obstacle and restart the scenario |
-| `H`          | toggle the in-window HUD overlay       |
-| `Esc`        | quit                              |
-
-## What I checked
-
-The `verify` build runs without a GPU and sanity-checks the core:
-
-- the grid returns exactly the same neighbours as a brute-force O(N²) scan;
-- under a dam-break, peak density stays within a few percent of rest, so the
-  fluid really is close to incompressible;
-- kinetic energy rises as the column falls and then decays as it settles,
-  instead of growing forever, which is the difference between a stable scheme and
-  one that's quietly adding energy.
+| Input        | Action                                         |
+|--------------|------------------------------------------------|
+| left-drag    | orbit the camera                               |
+| mouse wheel  | zoom                                           |
+| `Space`      | pause / resume                                 |
+| `↑` / `↓`    | simulation speed (substeps per frame)          |
+| `R`          | restart the dam break                          |
+| `M`          | reconstructed surface / particles              |
+| `P`          | particle overlay in surface mode               |
+| `F`          | foam and spray in surface mode                 |
+| `O`          | sphere obstacle on / off (restarts the scene)  |
+| `H`          | HUD on / off                                   |
+| `Esc`        | quit                                           |
 
 ## Layout
 
 ```
-src/vec3.hpp      hand-rolled 3D vector
-src/mat4.hpp      column-major matrix + orbital camera
-src/kernels.hpp   SPH smoothing kernels
-src/grid.hpp      uniform spatial-hash grid
-src/sph.hpp/.cpp  the solver: density, pressure, forces, integration
-src/viewer_*.cpp  OpenGL viewers (native Win32, and GLFW for CMake)
-src/verify.cpp    headless core check
+src/vec3.hpp, mat4.hpp          3D vector, 4x4 matrix, orbit camera
+src/thread_pool.hpp/.cpp        persistent fork-join pool for the parallel loops
+src/kernels.hpp                 SPH smoothing kernels
+src/grid.hpp                    uniform neighbour grid (counting sort)
+src/sph.hpp/.cpp                the solver: density, pressure, forces, integration, collisions
+src/scene.hpp/.cpp              the dam-break scenario and the tank wireframe
+src/surface.hpp/.cpp            surface reconstruction (scalar field + marching tetrahedra)
+src/gl.hpp, gl_win32.cpp        OpenGL 3.3 entry points and their WGL loader
+src/shaders.hpp                 GLSL sources
+src/renderer.hpp/.cpp           sky, tank, water, foam, particles, HUD
+src/win32.hpp, main_win32.cpp   window, input, OpenGL context, main loop
 ```
 
-## License
-
-MIT.
-
-
-## Surface rendering
-
-The Win32 viewer now contains a CPU iso-surface reconstruction pass for the SPH particles.
-It samples a compact scalar field around the particles, extracts a triangle mesh on a regular 3D grid, and renders it with a separate OpenGL shader.
-
-Controls:
-
-- `M` toggles between the reconstructed surface and the original particle-sphere view.
-- `P` overlays the particles while the surface view is active.
-- `F` toggles the cheap foam/spray overlay in surface mode.
-- `O` toggles a solid sphere obstacle in the tank and restarts the dam-break, so the water has something to wrap around and collide with.
-- `H` toggles the HUD overlay with FPS, particle count, mode flags and controls.
-
-Visual pass added after the first surface build:
-
-- the water surface shader now uses camera-dependent Fresnel rim light, tighter specular highlights, and height-based deep/shallow water tinting;
-- fast particles near the free surface are rendered as small bright point sprites, giving splashes and foam without changing the solver;
-- the window title shows whether foam overlay is active.
-
-Implementation notes:
-
-- The scalar field is deposited only within a small radius around each particle, so the build cost scales with particle count and local grid density rather than with every particle at every grid sample.
-- The extraction uses a cube grid subdivided into tetrahedra to avoid the large 256-case marching-cubes lookup table while producing the same kind of iso-surface mesh.
-- The surface mesh is rebuilt every second rendered frame by default; change `surfaceBuildStride`, `cell`, `radius`, and `iso` in `viewer_win32.cpp` to tune quality/performance.
-
-
-## Obstacle pass
-
-This version adds a simple solid sphere collider to the SPH solver and renders it as a wireframe obstacle in the tank. It is intentionally implemented in the solver rather than as a post-render trick: particles are projected out of the sphere during integration, their normal velocity is damped/reflected, and tangential velocity is reduced by a simple friction term.
-
-Press `O` to restart the dam-break with the obstacle enabled or disabled. This gives a more interesting video scenario than an empty box: the collapsing water column hits the sphere, splits around it, forms splashes, and then settles back into the pool.
-
-Implementation notes:
-
-- obstacle parameters live in `SphParams` (`sphereCenter`, `sphereRadius`, `sphereRestitution`, `sphereFriction`);
-- collision handling happens in `Sph::integrate()` after wall constraints;
-- the Win32 viewer draws the obstacle as three wire rings appended to the existing tank line buffer;
-- this is a collider, not a sampled boundary particle model, so it is cheap and stable but still visually approximate near the sphere surface.
-
-
-## HUD pass
-
-This version adds an in-window HUD to the native Win32 viewer. The overlay is drawn on top of the OpenGL scene and shows the current FPS, particle count, simulation speed, active render mode, pause state, surface vertex count, and the most important controls.
-
-Press `H` to hide or show the HUD. The window title still contains the compact status line, but the HUD makes recorded videos and screenshots easier to understand without relying on external captions.
+Only `win32.hpp`, `main_win32.cpp` and `gl_win32.cpp` are Windows-specific; the
+solver, the surface reconstruction and the renderer are plain C++ and OpenGL.
 
 ## License
 
-MIT License
-
-Copyright (c) 2026 Mykhailo Makarov
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+MIT, see [LICENSE](LICENSE).
 
 ## Support
 

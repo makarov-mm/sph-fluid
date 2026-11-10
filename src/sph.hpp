@@ -2,69 +2,79 @@
 #include "grid.hpp"
 #include "kernels.hpp"
 #include "vec3.hpp"
+
+#include <cstddef>
+#include <optional>
+#include <span>
 #include <vector>
 
-struct SphParams {
-    float h = 1.0f;               // smoothing radius
-    float restDensity = 1000.0f;  // rho0
-    float soundSpeed = 80.0f;     // c, sets EOS stiffness (Tait); keep ~10x max flow speed
-    float artVisc = 0.18f;        // Monaghan artificial viscosity alpha
-    float mass = 1.0f;            // per-particle (auto-calibrated by emitBlock)
-    Vec3  gravity{0.0f, -9.8f, 0.0f};
-    Vec3  boxMin{0.0f, 0.0f, 0.0f};
-    Vec3  boxMax{40.0f, 40.0f, 40.0f};
-    float restitution = 0.2f;     // wall bounce
-    float boundaryWidth = 2.0f;   // repulsive cushion thickness at vertical walls (0=off)
-    float boundaryStiffness = 60.0f; // strength of that cushion
-    float boundaryDrag = 3.0f;    // viscous drag inside the wall layer (kills climbing)
-    float dt = 0.0025f;
+class ThreadPool;
 
-    // Optional solid sphere obstacle. Particles are projected out of the sphere
-    // during integration, so it behaves as a simple collider for visual scenarios.
-    bool sphereObstacle = false;
-    Vec3 sphereCenter{17.0f, 10.0f, 12.0f};
-    float sphereRadius = 5.0f;
-    float sphereRestitution = 0.05f;
-    float sphereFriction = 0.55f;
-
-    static constexpr float gamma = 7.0f; // Tait exponent
+// Solid sphere the fluid flows around. Particles that end up inside are projected
+// back onto its surface during integration: a cheap, stable collider rather than
+// a sampled boundary, so the flow right at the sphere is only approximate.
+struct SphereCollider {
+    Vec3 center{};
+    float radius = 5.0f;
+    float restitution = 0.05f;  // share of the normal velocity reflected on impact
+    float friction = 0.55f;     // share of the tangential velocity removed per contact
 };
 
+struct SphParams {
+    float h = 1.0f;                     // smoothing radius
+    float restDensity = 1000.0f;        // rho0
+    float soundSpeed = 80.0f;           // c: Tait EOS stiffness, ~10x the peak flow speed
+    float artificialViscosity = 0.18f;  // Monaghan alpha
+    Vec3 gravity{0.0f, -9.8f, 0.0f};
+    Vec3 boxMin{0.0f, 0.0f, 0.0f};
+    Vec3 boxMax{40.0f, 40.0f, 40.0f};
+    float wallRestitution = 0.2f;       // bounce off the container walls
+    float boundaryWidth = 2.0f;         // repulsive cushion at the vertical walls (0 = off)
+    float boundaryStiffness = 60.0f;    // strength of that cushion
+    float boundaryDrag = 3.0f;          // viscous drag inside the cushion (stops wall climbing)
+    float dt = 0.0025f;                 // fixed step, inside the CFL limit h / (c + |v|max)
+    std::optional<SphereCollider> obstacle;
+
+    static constexpr float gamma = 7.0f;  // Tait exponent
+};
+
+// Weakly compressible SPH: poly6 density, Tait equation of state, symmetric
+// spiky-gradient pressure force, Monaghan artificial viscosity, semi-implicit
+// Euler. Particles are re-sorted by grid cell every step, so their order changes.
 class Sph {
 public:
-    explicit Sph(const SphParams& p);
+    Sph(const SphParams& params, ThreadPool& pool);
 
-    // Fill an axis-aligned block on a regular lattice (spacing = h*spacingFrac)
-    // and calibrate particle mass so the packed config sits at rest density.
-    void emitBlock(const Vec3& lo, const Vec3& hi, float spacingFrac = 0.6f);
+    // Fills the box [lo, hi] with a cubic lattice of spacing h * spacingFactor and
+    // calibrates the particle mass so that the packed fluid sits at rest density.
+    void emitBlock(const Vec3& lo, const Vec3& hi, float spacingFactor = 0.6f);
 
     void step();
 
     std::size_t size() const { return pos_.size(); }
-    const std::vector<Vec3>& positions() const { return pos_; }
-    const std::vector<Vec3>& velocities() const { return vel_; }
-    const std::vector<float>& densities() const { return density_; }
-    const SphParams& params() const { return p_; }
-    void setSphereObstacle(bool enabled, const Vec3& center, float radius) {
-        p_.sphereObstacle = enabled;
-        p_.sphereCenter = center;
-        p_.sphereRadius = radius;
-    }
-    bool sphereObstacleEnabled() const { return p_.sphereObstacle; }
-    void setThreads(int t) { threads_ = t < 1 ? 1 : t; }
+    std::span<const Vec3> positions() const { return pos_; }
+    std::span<const Vec3> velocities() const { return vel_; }
+    std::span<const float> densities() const { return density_; }
+    const SphParams& params() const { return params_; }
+    float particleMass() const { return mass_; }
 
 private:
+    void calibrateMass();
+    void sortByCell();
     void computeDensityPressure();
-    void computeAccel();
+    void computeAccelerations();
     void integrate();
-    float calibrateMass();
+    Vec3 boundaryAcceleration(const Vec3& x, const Vec3& v) const;
 
-    SphParams p_;
-    Kernels k_;
+    SphParams params_;
+    Kernels kernels_;
+    ThreadPool& pool_;
     Grid grid_;
     float taitB_;
-    int threads_ = 1;
+    float mass_ = 1.0f;
 
     std::vector<Vec3> pos_, vel_, accel_;
-    std::vector<float> density_, pressure_;
+    std::vector<float> density_;
+    std::vector<float> pressureTerm_;  // p / rho^2, shared by every pair in the force pass
+    std::vector<Vec3> scratch_;
 };

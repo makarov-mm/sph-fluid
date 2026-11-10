@@ -1,75 +1,85 @@
 #pragma once
 #include "vec3.hpp"
+
 #include <algorithm>
-#include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <numeric>
+#include <span>
 #include <vector>
 
-// Uniform spatial-hash grid for neighbour search. Cell size = smoothing radius,
-// so all neighbours of a particle lie in the 3x3x3 block of cells around it.
-// Built each step with a counting sort: O(N).
+// Uniform grid for neighbour search over a fixed domain. With the cell size equal
+// to the smoothing radius, every neighbour of a point lies in the 3x3x3 cells
+// around it.
+//
+// build() bins the points with a counting sort, O(N), and returns the permutation
+// that orders them by cell. Once the caller stores its particles in that order,
+// each cell (and each run of adjacent cells along x) is one contiguous index
+// range, so the neighbour loops read memory sequentially.
 class Grid {
 public:
-    void rebuild(const std::vector<Vec3>& pos, float cellSize) {
-        cell_ = cellSize;
-        inv_ = 1.0f / cellSize;
-        const int n = static_cast<int>(pos.size());
+    // Returns order: order[k] is the index of the point that goes to position k.
+    // Points outside the domain are clamped into the border cells, which keeps the
+    // search correct and only costs speed.
+    std::span<const std::uint32_t> build(std::span<const Vec3> points, float cellSize,
+                                         const Vec3& domainMin, const Vec3& domainMax) {
+        invCell_ = 1.0f / cellSize;
+        min_ = domainMin;
+        const auto cellsAlong = [this](float extent) { return std::max(1, static_cast<int>(extent * invCell_) + 1); };
+        nx_ = cellsAlong(domainMax.x - domainMin.x);
+        ny_ = cellsAlong(domainMax.y - domainMin.y);
+        nz_ = cellsAlong(domainMax.z - domainMin.z);
+        const auto cellCount = static_cast<std::size_t>(nx_) * static_cast<std::size_t>(ny_) * static_cast<std::size_t>(nz_);
 
-        // bounding box
-        min_ = pos.empty() ? Vec3{} : pos[0];
-        Vec3 max = min_;
-        for (const auto& p : pos) {
-            min_.x = std::min(min_.x, p.x); max.x = std::max(max.x, p.x);
-            min_.y = std::min(min_.y, p.y); max.y = std::max(max.y, p.y);
-            min_.z = std::min(min_.z, p.z); max.z = std::max(max.z, p.z);
-        }
-        dx_ = std::max(1, static_cast<int>((max.x - min_.x) * inv_) + 1);
-        dy_ = std::max(1, static_cast<int>((max.y - min_.y) * inv_) + 1);
-        dz_ = std::max(1, static_cast<int>((max.z - min_.z) * inv_) + 1);
-        const int cells = dx_ * dy_ * dz_;
-
-        cellOf_.resize(n);
-        cellStart_.assign(cells + 1, 0);
-        for (int i = 0; i < n; ++i) {
-            int c = cellIndex(pos[i]);
+        cellOf_.resize(points.size());
+        cellStart_.assign(cellCount + 1, 0);
+        for (std::size_t i = 0; i < points.size(); ++i) {
+            const std::uint32_t c = cellIndex(points[i]);
             cellOf_[i] = c;
             ++cellStart_[c + 1];
         }
-        for (int c = 0; c < cells; ++c) cellStart_[c + 1] += cellStart_[c];
+        std::inclusive_scan(cellStart_.begin() + 1, cellStart_.end(), cellStart_.begin() + 1);
 
-        sorted_.resize(n);
-        std::vector<int> cursor(cellStart_.begin(), cellStart_.end() - 1);
-        for (int i = 0; i < n; ++i) sorted_[cursor[cellOf_[i]]++] = i;
+        cursor_.assign(cellStart_.begin(), cellStart_.end() - 1);
+        order_.resize(points.size());
+        for (std::size_t i = 0; i < points.size(); ++i) order_[cursor_[cellOf_[i]]++] = static_cast<std::uint32_t>(i);
+        return order_;
     }
 
-    // Invoke fn(j) for every particle j whose cell is within the 3x3x3 block
-    // around `p`. The caller does the distance test.
+    // Calls fn(first, last) for the index ranges covering the 3x3x3 cells around p.
+    // Valid once the points are stored in the order returned by build().
     template <class Fn>
-    void forEachNeighbor(const Vec3& p, Fn&& fn) const {
-        int cx = clampI(static_cast<int>((p.x - min_.x) * inv_), dx_);
-        int cy = clampI(static_cast<int>((p.y - min_.y) * inv_), dy_);
-        int cz = clampI(static_cast<int>((p.z - min_.z) * inv_), dz_);
-        for (int gz = std::max(0, cz - 1); gz <= std::min(dz_ - 1, cz + 1); ++gz)
-        for (int gy = std::max(0, cy - 1); gy <= std::min(dy_ - 1, cy + 1); ++gy)
-        for (int gx = std::max(0, cx - 1); gx <= std::min(dx_ - 1, cx + 1); ++gx) {
-            int c = (gz * dy_ + gy) * dx_ + gx;
-            for (int k = cellStart_[c]; k < cellStart_[c + 1]; ++k) fn(sorted_[k]);
-        }
+    void forEachNeighborRange(const Vec3& p, Fn&& fn) const {
+        const int cx = cellCoord(p.x - min_.x, nx_);
+        const int cy = cellCoord(p.y - min_.y, ny_);
+        const int cz = cellCoord(p.z - min_.z, nz_);
+        const int x0 = std::max(cx - 1, 0), x1 = std::min(cx + 1, nx_ - 1);
+        const int y0 = std::max(cy - 1, 0), y1 = std::min(cy + 1, ny_ - 1);
+        const int z0 = std::max(cz - 1, 0), z1 = std::min(cz + 1, nz_ - 1);
+        for (int z = z0; z <= z1; ++z)
+            for (int y = y0; y <= y1; ++y) {
+                const auto row = static_cast<std::size_t>((z * ny_ + y) * nx_);
+                fn(cellStart_[row + static_cast<std::size_t>(x0)], cellStart_[row + static_cast<std::size_t>(x1) + 1]);
+            }
     }
 
 private:
-    int cellIndex(const Vec3& p) const {
-        int cx = clampI(static_cast<int>((p.x - min_.x) * inv_), dx_);
-        int cy = clampI(static_cast<int>((p.y - min_.y) * inv_), dy_);
-        int cz = clampI(static_cast<int>((p.z - min_.z) * inv_), dz_);
-        return (cz * dy_ + cy) * dx_ + cx;
+    int cellCoord(float offset, int cells) const {
+        return std::clamp(static_cast<int>(offset * invCell_), 0, cells - 1);
     }
-    static int clampI(int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); }
 
-    float cell_ = 1, inv_ = 1;
-    Vec3 min_;
-    int dx_ = 1, dy_ = 1, dz_ = 1;
-    std::vector<int> cellOf_;
-    std::vector<int> cellStart_;
-    std::vector<int> sorted_;
+    std::uint32_t cellIndex(const Vec3& p) const {
+        const int cx = cellCoord(p.x - min_.x, nx_);
+        const int cy = cellCoord(p.y - min_.y, ny_);
+        const int cz = cellCoord(p.z - min_.z, nz_);
+        return static_cast<std::uint32_t>((cz * ny_ + cy) * nx_ + cx);
+    }
+
+    float invCell_ = 1.0f;
+    Vec3 min_{};
+    int nx_ = 1, ny_ = 1, nz_ = 1;
+    std::vector<std::uint32_t> cellOf_;
+    std::vector<std::uint32_t> cellStart_;  // cellStart_[c]..cellStart_[c + 1] = particles of cell c
+    std::vector<std::uint32_t> cursor_;
+    std::vector<std::uint32_t> order_;
 };
